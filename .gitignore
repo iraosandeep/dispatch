@@ -1,0 +1,18 @@
+# Build output
+/bin/
+/dist/
+/dispatch
+*.exe
+coverage.out
+
+# Secrets — never commit credentials
+.env
+.env.*
+config.json
+*.pem
+*.key
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

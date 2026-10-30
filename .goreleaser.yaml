@@ -1,0 +1,69 @@
+version: 2
+
+project_name: dispatch
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: dispatch
+    main: ./cmd/dispatch
+    binary: dispatch
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}}
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: dispatch
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: false
+  prerelease: auto
+  footer: |
+    Verify downloads with `shasum -a 256 -c checksums.txt --ignore-missing`.
+
+# Homebrew distribution is planned once the release stabilizes. To enable it,
+# create a tap repository (e.g. homebrew-tap), add a HOMEBREW_TAP_TOKEN secret,
+# and uncomment:
+#
+# brews:
+#   - repository:
+#       owner: iraosandeep
+#       name: homebrew-tap
+#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+#     homepage: https://github.com/iraosandeep/dispatch
+#     description: One command. Any app. Instant Telegram notifications.
+#     license: MIT
+#     test: |
+#       system "#{bin}/dispatch", "version"
