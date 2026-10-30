@@ -4,6 +4,7 @@ package telegramtest
 import (
 	"encoding/json"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,7 +15,14 @@ import (
 // Request is a recorded Bot API call.
 type Request struct {
 	Method string
-	Body   map[string]any
+	Body   map[string]any // JSON body, or multipart text fields as strings
+	Files  map[string]File
+}
+
+// File is an uploaded multipart file.
+type File struct {
+	Name string
+	Data []byte
 }
 
 // Response is a canned reply. Zero value means {"ok":true,"result":true}.
@@ -77,11 +85,26 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body map[string]any
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	req := Request{Method: method, Body: map[string]any{}, Files: map[string]File{}}
+	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt == "multipart/form-data" {
+		if err := r.ParseMultipartForm(64 << 20); err == nil {
+			defer r.MultipartForm.RemoveAll()
+			for k, v := range r.MultipartForm.Value {
+				req.Body[k] = v[0]
+			}
+			for k, fhs := range r.MultipartForm.File {
+				f, _ := fhs[0].Open()
+				data, _ := io.ReadAll(f)
+				f.Close()
+				req.Files[k] = File{Name: fhs[0].Filename, Data: data}
+			}
+		}
+	} else {
+		_ = json.NewDecoder(r.Body).Decode(&req.Body)
+	}
 
 	s.mu.Lock()
-	s.requests = append(s.requests, Request{Method: method, Body: body})
+	s.requests = append(s.requests, req)
 	var resp Response
 	if q := s.responses[method]; len(q) > 0 {
 		resp = q[0]

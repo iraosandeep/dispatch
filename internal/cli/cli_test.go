@@ -348,3 +348,68 @@ func TestSensitiveLogKeys(t *testing.T) {
 		t.Errorf("log = %s", out)
 	}
 }
+
+func TestSendAttachment(t *testing.T) {
+	h := newHarness(t)
+	path := filepath.Join(t.TempDir(), "report.csv")
+	os.WriteFile(path, []byte("a,b\n1,2\n"), 0o600)
+
+	if code := h.run("send", "--attach", path, "--title", "Monthly report", "See attached"); code != ExitOK {
+		t.Fatalf("exit %d: %s", code, h.stderr.String())
+	}
+	reqs := h.tg.Requests("sendDocument")
+	if len(reqs) != 1 || len(h.tg.Requests("sendMessage")) != 0 {
+		t.Fatalf("requests = %+v", h.tg.Requests(""))
+	}
+	if reqs[0].Body["caption"] != "Monthly report\n\nSee attached" {
+		t.Errorf("caption = %q", reqs[0].Body["caption"])
+	}
+	if f := reqs[0].Files["document"]; f.Name != "report.csv" || string(f.Data) != "a,b\n1,2\n" {
+		t.Errorf("file = %q %q", f.Name, f.Data)
+	}
+}
+
+func TestSendAttachmentWithoutMessage(t *testing.T) {
+	h := newHarness(t)
+	path := filepath.Join(t.TempDir(), "go.sum")
+	os.WriteFile(path, []byte("checksums"), 0o600)
+	if code := h.run("send", "-a", path); code != ExitOK {
+		t.Fatalf("exit %d: %s", code, h.stderr.String())
+	}
+	if _, ok := h.tg.Requests("sendDocument")[0].Body["caption"]; ok {
+		t.Error("no caption expected")
+	}
+}
+
+func TestSendAttachmentErrors(t *testing.T) {
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty.txt")
+	os.WriteFile(empty, nil, 0o600)
+	small := filepath.Join(dir, "small.txt")
+	os.WriteFile(small, []byte("x"), 0o600)
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"missing", []string{"send", "--attach", filepath.Join(dir, "nope")}, "attachment not found"},
+		{"directory", []string{"send", "--attach", dir}, "directory"},
+		{"empty", []string{"send", "--attach", empty}, "empty"},
+		{"caption too long", []string{"send", "--attach", small, strings.Repeat("a", 1025)}, "1024"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			if code := h.run(tt.args...); code != ExitUsage {
+				t.Fatalf("exit %d; want %d (%s)", code, ExitUsage, h.stderr.String())
+			}
+			if !strings.Contains(h.stderr.String(), tt.want) {
+				t.Errorf("stderr %q should contain %q", h.stderr.String(), tt.want)
+			}
+			if n := len(h.tg.Requests("")); n != 0 {
+				t.Errorf("made %d Telegram calls", n)
+			}
+		})
+	}
+}

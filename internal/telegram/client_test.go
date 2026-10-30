@@ -233,3 +233,70 @@ func assertNoToken(t *testing.T, err error) {
 		}
 	}
 }
+
+func TestSendDocument(t *testing.T) {
+	srv := telegramtest.NewServer(t, token)
+	data := []byte("line 1\nline 2\n")
+	err := send(t, srv, telegram.Options{}, notification.Rendered{
+		Text:       "Nightly log",
+		Silent:     true,
+		Attachment: &notification.Attachment{Name: "backup.log", Data: data},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqs := srv.Requests("sendDocument")
+	if len(reqs) != 1 || len(srv.Requests("sendMessage")) != 0 {
+		t.Fatalf("requests: %+v", srv.Requests(""))
+	}
+	r := reqs[0]
+	if r.Body["chat_id"] != "-1001" || r.Body["caption"] != "Nightly log" || r.Body["disable_notification"] != "true" {
+		t.Errorf("fields = %v", r.Body)
+	}
+	if _, ok := r.Body["parse_mode"]; ok {
+		t.Error("captions must be plain text")
+	}
+	if f := r.Files["document"]; f.Name != "backup.log" || string(f.Data) != string(data) {
+		t.Errorf("file = %q %q", f.Name, f.Data)
+	}
+}
+
+func TestSendDocumentRetryResendsWholeFile(t *testing.T) {
+	srv := telegramtest.NewServer(t, token)
+	srv.Respond("sendDocument", telegramtest.Response{Status: 502, Body: `{"ok":false,"error_code":502,"description":"Bad Gateway"}`}, telegramtest.Response{})
+	data := []byte(strings.Repeat("x", 100_000))
+	err := send(t, srv, telegram.Options{}, notification.Rendered{Attachment: &notification.Attachment{Name: "a.bin", Data: data}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqs := srv.Requests("sendDocument")
+	if len(reqs) != 2 {
+		t.Fatalf("attempts = %d", len(reqs))
+	}
+	for i, r := range reqs {
+		if len(r.Files["document"].Data) != len(data) {
+			t.Errorf("attempt %d uploaded %d bytes; want %d", i+1, len(r.Files["document"].Data), len(data))
+		}
+	}
+	if _, ok := reqs[0].Body["caption"]; ok {
+		t.Error("empty caption should be omitted")
+	}
+}
+
+func TestDocumentErrorMapping(t *testing.T) {
+	srv := telegramtest.NewServer(t, token)
+	srv.Respond("sendDocument", telegramtest.Response{Status: 413, Body: `{"ok":false,"error_code":413,"description":"Request Entity Too Large"}`})
+	err := send(t, srv, telegram.Options{}, notification.Rendered{Attachment: &notification.Attachment{Name: "a", Data: []byte("1")}})
+	if notification.CodeOf(err) != notification.CodeAttachmentTooLarge {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestChatIDOfABot(t *testing.T) {
+	srv := telegramtest.NewServer(t, token)
+	srv.Respond("sendMessage", telegramtest.Response{Status: 403, Body: `{"ok":false,"error_code":403,"description":"Forbidden: the bot can't send messages to the bot"}`})
+	err := send(t, srv, telegram.Options{}, notification.Rendered{Text: "x"})
+	if notification.CodeOf(err) != notification.CodeInvalidDestination || !strings.Contains(err.Error(), "@userinfobot") {
+		t.Fatalf("got %v", err)
+	}
+}

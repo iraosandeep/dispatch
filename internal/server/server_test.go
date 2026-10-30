@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -340,5 +341,125 @@ func TestGracefulShutdown(t *testing.T) {
 	}
 	if _, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond); err == nil {
 		t.Error("listener still accepting after shutdown")
+	}
+}
+
+type formPart struct {
+	name, filename, content string
+}
+
+func multipartBody(t *testing.T, parts ...formPart) (string, string) {
+	t.Helper()
+	var buf strings.Builder
+	mw := multipart.NewWriter(&buf)
+	for _, p := range parts {
+		var w io.Writer
+		var err error
+		if p.filename != "" {
+			w, err = mw.CreateFormFile(p.name, p.filename)
+		} else {
+			w, err = mw.CreateFormField(p.name)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.WriteString(w, p.content)
+	}
+	mw.Close()
+	return buf.String(), mw.FormDataContentType()
+}
+
+func TestNotifyMultipartUpload(t *testing.T) {
+	p := &fakeProvider{}
+	s := newTestServer(t, p)
+	body, ct := multipartBody(t,
+		formPart{name: "message", content: "Monthly report"},
+		formPart{name: "priority", content: "low"},
+		formPart{name: "file", filename: "report.csv", content: "a,b\n1,2\n"},
+	)
+	r := do(t, s.Handler(), "POST", "/notify", body, authed("Content-Type", ct))
+	if r.status != 200 {
+		t.Fatalf("got %d %s", r.status, r.raw)
+	}
+	got := p.sent[0]
+	if got.Text != "Monthly report" || !got.Silent || got.Attachment == nil ||
+		got.Attachment.Name != "report.csv" || string(got.Attachment.Data) != "a,b\n1,2\n" {
+		t.Errorf("sent %+v", got)
+	}
+}
+
+func TestNotifyMultipartFileOnlyAndTextOnly(t *testing.T) {
+	p := &fakeProvider{}
+	s := newTestServer(t, p)
+
+	body, ct := multipartBody(t, formPart{name: "file", filename: "x.log", content: "data"})
+	if r := do(t, s.Handler(), "POST", "/notify", body, authed("Content-Type", ct)); r.status != 200 {
+		t.Fatalf("file only: %d %s", r.status, r.raw)
+	}
+	body, ct = multipartBody(t, formPart{name: "message", content: "plain"})
+	if r := do(t, s.Handler(), "POST", "/notify", body, authed("Content-Type", ct)); r.status != 200 {
+		t.Fatalf("text only: %d %s", r.status, r.raw)
+	}
+	if p.sent[1].Attachment != nil || p.sent[1].Text != "plain" {
+		t.Errorf("text-only multipart sent %+v", p.sent[1])
+	}
+}
+
+func TestNotifyMultipartErrors(t *testing.T) {
+	s := newTestServer(t, &fakeProvider{}, func(o *Options) { o.MaxUploadBytes = 2048 })
+	tests := []struct {
+		name   string
+		parts  []formPart
+		status int
+		code   string
+	}{
+		{"empty", nil, 400, "EMPTY_MESSAGE"},
+		{"unknown field", []formPart{{name: "chat_id", content: "1"}}, 400, "INVALID_REQUEST"},
+		{"two files", []formPart{{name: "file", filename: "a", content: "1"}, {name: "file", filename: "b", content: "2"}}, 400, "INVALID_REQUEST"},
+		{"file in text field", []formPart{{name: "message", filename: "m.txt", content: "x"}}, 400, "INVALID_REQUEST"},
+		{"empty file", []formPart{{name: "file", filename: "e.txt", content: ""}}, 400, "INVALID_REQUEST"},
+		{"caption too long", []formPart{{name: "message", content: strings.Repeat("a", 1025)}, {name: "file", filename: "a", content: "1"}}, 413, "MESSAGE_TOO_LARGE"},
+		{"body too large", []formPart{{name: "file", filename: "big", content: strings.Repeat("x", 4096)}}, 413, "PAYLOAD_TOO_LARGE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, ct := multipartBody(t, tt.parts...)
+			r := do(t, s.Handler(), "POST", "/notify", body, authed("Content-Type", ct))
+			if r.status != tt.status || errCode(r) != tt.code {
+				t.Fatalf("got %d %s; want %d %s", r.status, r.raw, tt.status, tt.code)
+			}
+		})
+	}
+}
+
+func TestNotifyMultipartRequiresAuth(t *testing.T) {
+	p := &fakeProvider{}
+	s := newTestServer(t, p)
+	body, ct := multipartBody(t, formPart{name: "file", filename: "x", content: "1"})
+	if r := do(t, s.Handler(), "POST", "/notify", body, map[string]string{"Content-Type": ct}); r.status != 401 {
+		t.Fatalf("got %d", r.status)
+	}
+	if len(p.sent) != 0 {
+		t.Error("unauthenticated upload was sent")
+	}
+}
+
+func TestConcurrentUploadLimit(t *testing.T) {
+	s := newTestServer(t, &fakeProvider{}, func(o *Options) { o.MaxConcurrentUploads = 1 })
+	s.uploadSem <- struct{}{} // simulate one upload in progress
+
+	body, ct := multipartBody(t, formPart{name: "file", filename: "x", content: "1"})
+	r := do(t, s.Handler(), "POST", "/notify", body, authed("Content-Type", ct))
+	if r.status != 429 || errCode(r) != "RATE_LIMITED" || r.header.Get("Retry-After") == "" {
+		t.Fatalf("got %d %s", r.status, r.raw)
+	}
+	// JSON requests are not affected by the upload limit.
+	if r := do(t, s.Handler(), "POST", "/notify", `{"message":"x"}`, authed()); r.status != 200 {
+		t.Fatalf("json got %d %s", r.status, r.raw)
+	}
+
+	<-s.uploadSem
+	if r := do(t, s.Handler(), "POST", "/notify", body, authed("Content-Type", ct)); r.status != 200 {
+		t.Fatalf("after release got %d %s", r.status, r.raw)
 	}
 }

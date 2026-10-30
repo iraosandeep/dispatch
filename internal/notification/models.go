@@ -3,6 +3,7 @@
 package notification
 
 import (
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -32,6 +33,10 @@ const (
 	// MaxEmojiLength bounds the optional emoji prefix (in runes). Some emoji
 	// are several code points (skin tones, ZWJ sequences, flags).
 	MaxEmojiLength = 16
+	// MaxCaptionLength is Telegram's limit for text sent with an attachment.
+	MaxCaptionLength = 1024
+	// MaxAttachmentBytes is the largest file a Telegram bot can upload.
+	MaxAttachmentBytes = 50 << 20
 
 	highPriorityMarker = "🚨"
 )
@@ -54,6 +59,15 @@ type Message struct {
 	Body     string
 	Priority Priority
 	Emoji    string
+	// Attachment is an optional file. When set, Body becomes the caption and
+	// may be empty.
+	Attachment *Attachment
+}
+
+// Attachment is a file delivered with a notification.
+type Attachment struct {
+	Name string // base file name shown to the recipient
+	Data []byte
 }
 
 // Rendered is the provider-ready form of a Message.
@@ -62,12 +76,17 @@ type Rendered struct {
 	Text string
 	// Silent asks the provider to deliver without sound.
 	Silent bool
+	// Attachment, when non-nil, is sent as a document with Text as caption.
+	Attachment *Attachment
 }
 
 // Validate checks the message without modifying it. It never truncates.
 func (m Message) Validate() error {
-	if strings.TrimSpace(m.Body) == "" {
+	if m.Attachment == nil && strings.TrimSpace(m.Body) == "" {
 		return Errorf(CodeEmptyMessage, "message is empty")
+	}
+	if err := m.Attachment.validate(); err != nil {
+		return err
 	}
 	if !utf8.ValidString(m.Body) || !utf8.ValidString(m.Title) || !utf8.ValidString(m.Emoji) {
 		return Errorf(CodeInvalidRequest, "message must be valid UTF-8 text")
@@ -87,12 +106,46 @@ func (m Message) Validate() error {
 	if n := utf8.RuneCountInString(m.Emoji); n > MaxEmojiLength {
 		return Errorf(CodeInvalidRequest, "emoji is %d characters; the maximum is %d", n, MaxEmojiLength)
 	}
+	if m.Attachment != nil {
+		if n := TextLength(m.Render().Text); n > MaxCaptionLength {
+			return Errorf(CodeMessageTooLarge,
+				"caption is %d characters after formatting; Telegram's limit with an attachment is %d (Dispatch never truncates messages)",
+				n, MaxCaptionLength)
+		}
+		return nil
+	}
 	if n := TextLength(m.Render().Text); n > MaxTextLength {
 		return Errorf(CodeMessageTooLarge,
 			"message is %d characters after formatting; Telegram's limit is %d (Dispatch never truncates messages)",
 			n, MaxTextLength)
 	}
 	return nil
+}
+
+func (a *Attachment) validate() error {
+	switch {
+	case a == nil:
+		return nil
+	case strings.TrimSpace(a.Name) == "" || strings.ContainsAny(a.Name, "/\\\x00\r\n"):
+		return Errorf(CodeInvalidRequest, "attachment needs a plain file name")
+	case len(a.Data) == 0:
+		return Errorf(CodeInvalidRequest, "attachment %q is empty", a.Name)
+	case len(a.Data) > MaxAttachmentBytes:
+		return Errorf(CodeAttachmentTooLarge,
+			"attachment %q is %s; Telegram bots can upload at most %s", a.Name, FormatBytes(len(a.Data)), FormatBytes(MaxAttachmentBytes))
+	}
+	return nil
+}
+
+// FormatBytes renders a byte count for error messages, e.g. "12.3 MB".
+func FormatBytes(n int) string {
+	switch {
+	case n >= 1<<20:
+		return strconv.FormatFloat(float64(n)/(1<<20), 'f', 1, 64) + " MB"
+	case n >= 1<<10:
+		return strconv.FormatFloat(float64(n)/(1<<10), 'f', 1, 64) + " KB"
+	}
+	return strconv.Itoa(n) + " bytes"
 }
 
 // Render produces the plain-text form delivered to the provider.
@@ -111,16 +164,22 @@ func (m Message) Render() Rendered {
 	}
 
 	title := strings.TrimSpace(m.Title)
+	header := prefix
+	if title != "" {
+		header = append(header, title)
+	}
 	var text string
 	switch {
-	case title != "":
-		text = strings.Join(append(prefix, title), " ") + "\n\n" + m.Body
-	case len(prefix) > 0:
-		text = strings.Join(prefix, " ") + " " + m.Body
-	default:
+	case len(header) == 0:
 		text = m.Body
+	case strings.TrimSpace(m.Body) == "": // attachment with only a title/emoji
+		text = strings.Join(header, " ")
+	case title != "":
+		text = strings.Join(header, " ") + "\n\n" + m.Body
+	default:
+		text = strings.Join(header, " ") + " " + m.Body
 	}
-	return Rendered{Text: text, Silent: p == PriorityLow}
+	return Rendered{Text: text, Silent: p == PriorityLow, Attachment: m.Attachment}
 }
 
 // TextLength counts UTF-16 code units, which is how Telegram measures

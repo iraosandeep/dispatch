@@ -25,6 +25,15 @@ func (p *Provider) Name() string { return "telegram" }
 
 // Send delivers msg. A nil error means Telegram accepted the message.
 func (p *Provider) Send(ctx context.Context, msg notification.Rendered) error {
+	if a := msg.Attachment; a != nil {
+		return MapError(p.client.SendDocument(ctx, SendDocumentRequest{
+			ChatID:              p.chatID,
+			FileName:            a.Name,
+			Data:                a.Data,
+			Caption:             msg.Text,
+			DisableNotification: msg.Silent,
+		}))
+	}
 	err := p.client.SendMessage(ctx, SendMessageRequest{
 		ChatID:              p.chatID,
 		Text:                msg.Text,
@@ -53,8 +62,15 @@ func MapError(err error) error {
 		case apiErr.StatusCode == http.StatusBadRequest && strings.Contains(desc, "chat not found"):
 			return wrap(notification.CodeInvalidDestination, err,
 				"Telegram chat not found; check DISPATCH_CHAT_ID and make sure the chat has started a conversation with the bot")
-		case apiErr.StatusCode == http.StatusBadRequest && strings.Contains(desc, "message is too long"):
-			return wrap(notification.CodeMessageTooLarge, err, "Telegram rejected the message as too long")
+		case apiErr.StatusCode == http.StatusBadRequest && strings.Contains(desc, "too long"):
+			return wrap(notification.CodeMessageTooLarge, err, "Telegram rejected the message or caption as too long")
+		case apiErr.StatusCode == http.StatusRequestEntityTooLarge:
+			return wrap(notification.CodeAttachmentTooLarge, err,
+				"Telegram rejected the file as too large; bots can upload at most 50 MB")
+		case apiErr.StatusCode == http.StatusForbidden && strings.Contains(desc, "bot can't send messages to the bot"),
+			apiErr.StatusCode == http.StatusForbidden && strings.Contains(desc, "bots can't send messages to bots"):
+			return wrap(notification.CodeInvalidDestination, err,
+				"DISPATCH_CHAT_ID belongs to a bot; use your own user ID or a group ID (message @userinfobot to find yours)")
 		case apiErr.StatusCode == http.StatusForbidden:
 			return wrap(notification.CodeInvalidDestination, err,
 				"the bot cannot message this chat ("+apiErr.Description+"); unblock the bot or add it to the group")

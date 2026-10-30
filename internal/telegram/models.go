@@ -11,6 +11,15 @@ type SendMessageRequest struct {
 	LinkPreviewOptions  *LinkPreviewOptions `json:"link_preview_options,omitempty"`
 }
 
+// SendDocumentRequest uploads a file. Caption is plain text (no parse_mode).
+type SendDocumentRequest struct {
+	ChatID              string
+	FileName            string
+	Data                []byte
+	Caption             string
+	DisableNotification bool
+}
+
 // LinkPreviewOptions controls URL previews in a message.
 type LinkPreviewOptions struct {
 	IsDisabled bool `json:"is_disabled"`

@@ -17,7 +17,10 @@ import (
 const (
 	DefaultMaxBodyBytes    = 64 << 10
 	DefaultDeliveryTimeout = 30 * time.Second
-	shutdownTimeout        = 20 * time.Second
+	DefaultUploadTimeout   = 2 * time.Minute
+	// DefaultMaxUploadBytes allows a maximum-size Telegram upload plus form fields.
+	DefaultMaxUploadBytes = notification.MaxAttachmentBytes + 1<<20
+	shutdownTimeout       = 20 * time.Second
 )
 
 // Options configures a Server.
@@ -32,17 +35,26 @@ type Options struct {
 	RateLimit       float64 // notify requests per second; 0 disables
 	RateBurst       int     // defaults to max(1, ceil(RateLimit*5))
 	DeliveryTimeout time.Duration
-	MaxBodyBytes    int64
-	TLSCert         string
-	TLSKey          string
-	Version         string
+	// UploadTimeout is the minimum delivery time allowed for requests with
+	// an attachment. Default 2m.
+	UploadTimeout time.Duration
+	// MaxBodyBytes limits JSON bodies and each multipart text field.
+	MaxBodyBytes int64
+	// MaxUploadBytes limits multipart (file upload) bodies.
+	MaxUploadBytes int64
+	// MaxConcurrentUploads bounds uploads held in memory at once. Default 4.
+	MaxConcurrentUploads int
+	TLSCert              string
+	TLSKey               string
+	Version              string
 }
 
 // Server is the Dispatch HTTP API.
 type Server struct {
-	opts    Options
-	logger  *slog.Logger
-	handler http.Handler
+	opts      Options
+	logger    *slog.Logger
+	handler   http.Handler
+	uploadSem chan struct{}
 }
 
 // New validates opts and builds a Server.
@@ -62,7 +74,16 @@ func New(opts Options) (*Server, error) {
 	if opts.MaxBodyBytes <= 0 {
 		opts.MaxBodyBytes = DefaultMaxBodyBytes
 	}
-	s := &Server{opts: opts, logger: opts.Logger}
+	if opts.UploadTimeout <= 0 {
+		opts.UploadTimeout = DefaultUploadTimeout
+	}
+	if opts.MaxUploadBytes <= 0 {
+		opts.MaxUploadBytes = DefaultMaxUploadBytes
+	}
+	if opts.MaxConcurrentUploads <= 0 {
+		opts.MaxConcurrentUploads = 4
+	}
+	s := &Server{opts: opts, logger: opts.Logger, uploadSem: make(chan struct{}, opts.MaxConcurrentUploads)}
 	s.handler = s.routes()
 	return s, nil
 }
@@ -105,8 +126,8 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           s.handler,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      s.opts.DeliveryTimeout + 10*time.Second,
+		ReadTimeout:       s.opts.UploadTimeout, // large uploads from slow clients
+		WriteTimeout:      max(s.opts.DeliveryTimeout, s.opts.UploadTimeout) + 10*time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 		ErrorLog:          slog.NewLogLogger(s.logger.Handler(), slog.LevelWarn),

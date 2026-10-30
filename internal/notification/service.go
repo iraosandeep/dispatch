@@ -51,6 +51,9 @@ func (s *Service) Notify(ctx context.Context, m Message) error {
 		slog.Int("length", TextLength(m.Body)),
 		slog.Duration("duration", time.Since(start)),
 	}
+	if m.Attachment != nil {
+		attrs = append(attrs, slog.Int("attachment_bytes", len(m.Attachment.Data)))
+	}
 	if err != nil {
 		s.logger.Warn("notification failed", append(attrs,
 			slog.String("code", string(CodeOf(err))),

@@ -14,6 +14,7 @@ const (
 	CodeInvalidRequest     Code = "INVALID_REQUEST"
 	CodeEmptyMessage       Code = "EMPTY_MESSAGE"
 	CodeMessageTooLarge    Code = "MESSAGE_TOO_LARGE"
+	CodeAttachmentTooLarge Code = "ATTACHMENT_TOO_LARGE"
 	CodeNotConfigured      Code = "NOT_CONFIGURED"
 	CodeInvalidCredentials Code = "INVALID_CREDENTIALS"
 	CodeInvalidDestination Code = "INVALID_DESTINATION"

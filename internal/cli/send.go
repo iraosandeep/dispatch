@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,11 +20,15 @@ import (
 // only prevents reading unbounded input before reporting it as too large.
 const maxInputBytes = 1 << 20
 
+// attachmentTimeout replaces the default delivery timeout when uploading a
+// file, unless the user set a timeout explicitly.
+const attachmentTimeout = 2 * time.Minute
+
 func (a *App) sendCmd() *cobra.Command {
 	var (
-		title, priority, emoji, file, chatID string
-		useStdin, quiet                      bool
-		timeout                              time.Duration
+		title, priority, emoji, file, attach, chatID string
+		useStdin, quiet                              bool
+		timeout                                      time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -35,6 +40,9 @@ The message comes from the arguments, standard input (--stdin), or a file
 (--file). Exactly one source must be used. Messages are sent as plain text and
 are never truncated: anything over Telegram's 4096-character limit is rejected.
 
+With --attach, the file is uploaded as a Telegram document (up to 50 MB) and
+the message, if any, becomes its caption (up to 1024 characters).
+
 Priority on Telegram:
   low     delivered silently (no sound)
   normal  default notification behavior
@@ -45,17 +53,25 @@ Exit codes: 0 accepted, 1 delivery failed, 2 invalid input,
 		Example: `  dispatch send "Backup successful"
   dispatch send --title "Import Failed" --priority high "The accounting import failed"
   echo "Deployment succeeded" | dispatch send --stdin
-  dispatch send --file ./report.txt --emoji 📊`,
+  dispatch send --file ./report.txt --emoji 📊
+  dispatch send --attach ./backup.log "Nightly backup log"
+  dispatch send --attach ./report.pdf --title "Monthly report"`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			body, err := a.readBody(args, useStdin, file)
+			body, err := a.readBody(args, useStdin, file, attach != "")
 			if err != nil {
 				return err
+			}
+			var attachment *notification.Attachment
+			if attach != "" {
+				if attachment, err = readAttachment(attach); err != nil {
+					return err
+				}
 			}
 			p, err := notification.ParsePriority(priority)
 			if err != nil {
 				return err
 			}
-			msg := notification.Message{Title: title, Body: body, Priority: p, Emoji: emoji}
+			msg := notification.Message{Title: title, Body: body, Priority: p, Emoji: emoji, Attachment: attachment}
 			// Reject bad input before touching configuration or the network.
 			if err := msg.Validate(); err != nil {
 				return err
@@ -81,7 +97,11 @@ Exit codes: 0 accepted, 1 delivery failed, 2 invalid input,
 				return err
 			}
 
-			ctx, cancel := context.WithTimeout(cmd.Context(), cfg.Timeout.Std())
+			timeoutDur := cfg.Timeout.Std()
+			if attachment != nil && cfg.SourceOf("timeout") == string(config.SourceDefault) {
+				timeoutDur = attachmentTimeout
+			}
+			ctx, cancel := context.WithTimeout(cmd.Context(), timeoutDur)
 			defer cancel()
 			if err := svc.Notify(ctx, msg); err != nil {
 				return err
@@ -98,7 +118,8 @@ Exit codes: 0 accepted, 1 delivery failed, 2 invalid input,
 	f.StringVarP(&priority, "priority", "p", "normal", "low, normal, or high")
 	f.StringVarP(&emoji, "emoji", "e", "", "optional emoji prefix, e.g. ✅")
 	f.BoolVar(&useStdin, "stdin", false, "read the message from standard input")
-	f.StringVarP(&file, "file", "f", "", "read the message from a file")
+	f.StringVarP(&file, "file", "f", "", "read the message text from a file")
+	f.StringVarP(&attach, "attach", "a", "", "upload a file as a document (max 50 MB); the message becomes its caption")
 	f.StringVar(&chatID, "chat-id", "", "override the destination chat ID")
 	f.DurationVar(&timeout, "timeout", config.DefaultTimeout, "total time allowed for delivery, including retries")
 	f.BoolVarP(&quiet, "quiet", "q", false, "print nothing on success")
@@ -106,7 +127,8 @@ Exit codes: 0 accepted, 1 delivery failed, 2 invalid input,
 }
 
 // readBody returns the message from exactly one source.
-func (a *App) readBody(args []string, useStdin bool, file string) (string, error) {
+// With an attachment, the message is optional.
+func (a *App) readBody(args []string, useStdin bool, file string, hasAttachment bool) (string, error) {
 	sources := 0
 	for _, used := range []bool{len(args) > 0, useStdin, file != ""} {
 		if used {
@@ -114,8 +136,10 @@ func (a *App) readBody(args []string, useStdin bool, file string) (string, error
 		}
 	}
 	switch {
+	case sources == 0 && hasAttachment:
+		return "", nil
 	case sources == 0:
-		return "", usageErrorf("no message provided; pass it as an argument, or use --stdin or --file")
+		return "", usageErrorf("no message provided; pass it as an argument, or use --stdin, --file, or --attach")
 	case sources > 1:
 		return "", usageErrorf("use only one message source: an argument, --stdin, or --file")
 	}
@@ -150,4 +174,28 @@ func readLimited(r io.Reader, name string) (string, error) {
 	}
 	// Drop the trailing newline that echo and most files end with.
 	return strings.TrimRight(string(data), "\r\n"), nil
+}
+
+// readAttachment loads a file for upload, checking size before reading.
+func readAttachment(path string) (*notification.Attachment, error) {
+	info, err := os.Stat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil, usageErrorf("attachment not found: %s", path)
+	case err != nil:
+		return nil, usageErrorf("cannot read attachment: %v", err)
+	case info.IsDir():
+		return nil, usageErrorf("attachment is a directory: %s (archive it first, e.g. with tar or zip)", path)
+	case info.Size() == 0:
+		return nil, usageErrorf("attachment is empty: %s", path)
+	case info.Size() > notification.MaxAttachmentBytes:
+		return nil, notification.Errorf(notification.CodeAttachmentTooLarge,
+			"attachment %s is %s; Telegram bots can upload at most %s",
+			path, notification.FormatBytes(int(info.Size())), notification.FormatBytes(notification.MaxAttachmentBytes))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, usageErrorf("cannot read attachment: %v", err)
+	}
+	return &notification.Attachment{Name: filepath.Base(path), Data: data}, nil
 }

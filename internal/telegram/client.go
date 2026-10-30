@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -37,7 +38,10 @@ type Options struct {
 	// will honor automatically. Longer waits fail with a rate-limit error.
 	// Default 30s.
 	MaxRetryAfter time.Duration
-	Logger        *slog.Logger
+	// AttemptTimeout bounds each JSON API attempt so a hung connection can be
+	// retried. Uploads are bounded only by the caller's context. Default 15s.
+	AttemptTimeout time.Duration
+	Logger         *slog.Logger
 }
 
 // Client calls the Telegram Bot API. It is safe for concurrent use.
@@ -49,6 +53,7 @@ type Client struct {
 	baseBackoff   time.Duration
 	maxBackoff    time.Duration
 	maxRetryAfter time.Duration
+	attemptTO     time.Duration
 	logger        *slog.Logger
 	sleep         func(context.Context, time.Duration) error
 }
@@ -63,6 +68,7 @@ func New(token string, opts Options) *Client {
 		baseBackoff:   opts.BaseBackoff,
 		maxBackoff:    opts.MaxBackoff,
 		maxRetryAfter: opts.MaxRetryAfter,
+		attemptTO:     opts.AttemptTimeout,
 		logger:        opts.Logger,
 		sleep:         sleepContext,
 	}
@@ -70,7 +76,12 @@ func New(token string, opts Options) *Client {
 		c.baseURL = DefaultBaseURL
 	}
 	if c.http == nil {
-		c.http = &http.Client{Timeout: 15 * time.Second}
+		// No client-wide timeout: uploads can take minutes. Every call is
+		// bounded by the caller's context and, for JSON calls, attemptTO.
+		c.http = &http.Client{}
+	}
+	if c.attemptTO <= 0 {
+		c.attemptTO = 15 * time.Second
 	}
 	if c.maxAttempts <= 0 {
 		c.maxAttempts = 3
@@ -149,15 +160,63 @@ func (c *Client) SendMessage(ctx context.Context, req SendMessageRequest) error 
 	return c.call(ctx, "sendMessage", req, nil)
 }
 
-// call performs a Bot API request with bounded retries for transient failures.
+// SendDocument uploads a file with an optional plain-text caption.
+func (c *Client) SendDocument(ctx context.Context, req SendDocumentRequest) error {
+	var head bytes.Buffer
+	mw := multipart.NewWriter(&head)
+	fields := [][2]string{{"chat_id", req.ChatID}}
+	if req.Caption != "" {
+		fields = append(fields, [2]string{"caption", req.Caption})
+	}
+	if req.DisableNotification {
+		fields = append(fields, [2]string{"disable_notification", "true"})
+	}
+	for _, f := range fields {
+		if err := mw.WriteField(f[0], f[1]); err != nil {
+			return fmt.Errorf("telegram sendDocument: encode request: %w", err)
+		}
+	}
+	if _, err := mw.CreateFormFile("document", req.FileName); err != nil {
+		return fmt.Errorf("telegram sendDocument: encode request: %w", err)
+	}
+	// Stream the file between the multipart header and the closing boundary
+	// (what mw.Close would write) instead of copying it into the buffer.
+	tail := "\r\n--" + mw.Boundary() + "--\r\n"
+	contentType := mw.FormDataContentType()
+	size := int64(head.Len() + len(req.Data) + len(tail))
+
+	body := func() (io.Reader, string, int64) {
+		return io.MultiReader(bytes.NewReader(head.Bytes()), bytes.NewReader(req.Data), strings.NewReader(tail)),
+			contentType, size
+	}
+	return c.retry(ctx, "sendDocument", body, nil, 0)
+}
+
+// requestBody produces a fresh request body for each attempt.
+type requestBody func() (r io.Reader, contentType string, size int64)
+
+// call performs a JSON Bot API request with bounded retries.
 func (c *Client) call(ctx context.Context, method string, payload, out any) error {
-	body, err := json.Marshal(payload)
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("telegram %s: encode request: %w", method, err)
 	}
+	body := func() (io.Reader, string, int64) {
+		return bytes.NewReader(data), "application/json", int64(len(data))
+	}
+	return c.retry(ctx, method, body, out, c.attemptTO)
+}
 
+// retry runs a request, retrying transient failures with backoff. A positive
+// attemptTimeout bounds each individual attempt.
+func (c *Client) retry(ctx context.Context, method string, body requestBody, out any, attemptTimeout time.Duration) error {
 	for attempt := 1; ; attempt++ {
-		err := c.do(ctx, method, body, out)
+		attemptCtx, cancel := ctx, context.CancelFunc(func() {})
+		if attemptTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, attemptTimeout)
+		}
+		err := c.do(attemptCtx, method, body, out)
+		cancel()
 		if err == nil {
 			return nil
 		}
@@ -213,13 +272,15 @@ func (c *Client) backoff(attempt int) time.Duration {
 	return d + time.Duration(rand.Int64N(int64(d)/5+1))
 }
 
-func (c *Client) do(ctx context.Context, method string, body []byte, out any) error {
+func (c *Client) do(ctx context.Context, method string, body requestBody, out any) error {
 	endpoint := c.baseURL + "/bot" + c.token + "/" + method
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	reader, contentType, size := body()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, reader)
 	if err != nil {
 		return fmt.Errorf("telegram %s: %s", method, c.redact(err.Error()))
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = size
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)

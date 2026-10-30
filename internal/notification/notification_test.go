@@ -134,3 +134,47 @@ func TestCodeOfUncategorized(t *testing.T) {
 		t.Error("uncategorized errors should map to DELIVERY_FAILED")
 	}
 }
+
+func TestAttachmentValidation(t *testing.T) {
+	file := &Attachment{Name: "report.pdf", Data: []byte("%PDF")}
+	tests := []struct {
+		name string
+		msg  Message
+		code Code
+	}{
+		{"file only", Message{Attachment: file}, ""},
+		{"file with caption", Message{Body: "Monthly report", Attachment: file}, ""},
+		{"caption at limit", Message{Body: strings.Repeat("a", MaxCaptionLength), Attachment: file}, ""},
+		{"caption over limit", Message{Body: strings.Repeat("a", MaxCaptionLength+1), Attachment: file}, CodeMessageTooLarge},
+		{"empty file", Message{Attachment: &Attachment{Name: "x.txt"}}, CodeInvalidRequest},
+		{"path in name", Message{Attachment: &Attachment{Name: "../x", Data: []byte("1")}}, CodeInvalidRequest},
+		{"too large", Message{Attachment: &Attachment{Name: "big.bin", Data: make([]byte, MaxAttachmentBytes+1)}}, CodeAttachmentTooLarge},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.msg.Validate()
+			if tt.code == "" && err != nil || tt.code != "" && CodeOf(err) != tt.code {
+				t.Fatalf("Validate() = %v; want code %q", err, tt.code)
+			}
+		})
+	}
+}
+
+func TestRenderAttachmentCaption(t *testing.T) {
+	file := &Attachment{Name: "a.txt", Data: []byte("x")}
+	cases := []struct {
+		msg  Message
+		want string
+	}{
+		{Message{Attachment: file}, ""},
+		{Message{Title: "Monthly report", Attachment: file}, "Monthly report"},
+		{Message{Emoji: "📊", Priority: PriorityHigh, Attachment: file}, "🚨 📊"},
+		{Message{Title: "T", Body: "B", Attachment: file}, "T\n\nB"},
+	}
+	for _, c := range cases {
+		r := c.msg.Render()
+		if r.Text != c.want || r.Attachment != file {
+			t.Errorf("Render(%+v) = %q; want %q", c.msg, r.Text, c.want)
+		}
+	}
+}

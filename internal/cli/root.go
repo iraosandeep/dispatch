@@ -24,7 +24,7 @@ import (
 const (
 	ExitOK        = 0 // notification accepted
 	ExitFailure   = 1 // delivery failed or unexpected error
-	ExitUsage     = 2 // invalid arguments or message (empty, too large)
+	ExitUsage     = 2 // invalid arguments, message, or attachment (empty, too large)
 	ExitConfig    = 3 // missing or rejected configuration (token, chat ID, API key)
 	ExitTransient = 4 // rate limit, timeout, or network error; retrying later may succeed
 )
@@ -193,7 +193,8 @@ func exitCode(err error) int {
 	var ne *notification.Error
 	if errors.As(err, &ne) {
 		switch ne.Code {
-		case notification.CodeInvalidRequest, notification.CodeEmptyMessage, notification.CodeMessageTooLarge:
+		case notification.CodeInvalidRequest, notification.CodeEmptyMessage, notification.CodeMessageTooLarge,
+			notification.CodeAttachmentTooLarge:
 			return ExitUsage
 		case notification.CodeNotConfigured, notification.CodeInvalidCredentials, notification.CodeInvalidDestination:
 			return ExitConfig

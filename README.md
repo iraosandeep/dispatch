@@ -152,7 +152,9 @@ dispatch send Backup successful                 # unquoted words are joined
 dispatch send --title "Import Failed" --priority high "The accounting import failed"
 dispatch send --emoji ✅ "Tests passed"
 echo "Deployment succeeded" | dispatch send --stdin
-dispatch send --file ./report.txt
+dispatch send --file ./report.txt                # file contents as the message text
+dispatch send --attach ./backup.log "Nightly log" # upload a file, message becomes the caption
+dispatch send --attach ./report.pdf --title "Monthly report"
 dispatch send --chat-id -100987654321 "To another chat"
 dispatch send -q "No output on success"
 dispatch test                                    # verify the token and send a test message
@@ -165,6 +167,15 @@ dispatch version
 - Empty messages are rejected.
 - Telegram's limit is 4096 characters, counted in UTF-16 units, so most emoji count as two. The count includes the title and any priority or emoji prefixes. **Dispatch never truncates.** It rejects oversized messages and reports their length.
 - A single trailing newline is removed from `--stdin` and `--file` input.
+
+### Attachments
+
+`--file` sends a text file's *contents* as the message. `--attach` uploads the file itself as a Telegram **document**, so any file type works: logs, CSVs, PDFs, images, and archives.
+
+- The file can be at most **50 MB**, which is Telegram's limit for bots. Empty files and directories are rejected. To send a directory, archive it first, for example with `tar czf logs.tgz logs/`.
+- The message is optional. If present, it becomes the **caption**, limited to **1024 characters** including the title and any prefixes. Captions are plain text, like messages.
+- `--title`, `--emoji` and `--priority` work as they do for text messages. `low` uploads silently.
+- When `--attach` is used, the default timeout increases to **2 minutes**. An explicit `--timeout` or `DISPATCH_TIMEOUT` overrides it.
 
 ### Priority
 
@@ -184,7 +195,7 @@ Telegram has no native notification priority. Dispatch maps priorities onto what
 |---|---|---|
 | `0` | Telegram accepted the message | |
 | `1` | Delivery failed | Telegram rejected the message, unexpected error |
-| `2` | Invalid usage or input | Empty or oversized message, bad flag, unknown priority |
+| `2` | Invalid usage or input | Empty or oversized message or caption, missing/empty/oversized attachment, bad flag |
 | `3` | Configuration problem | Missing or invalid token, chat not found, bot blocked |
 | `4` | Transient failure; retrying later may succeed | Rate limit, timeout, network or DNS error |
 
@@ -264,6 +275,23 @@ curl -X POST http://localhost:8787/notify \
 
 Requests must use `Content-Type: application/json`, contain exactly one JSON object, and be at most 64 KiB. Unknown fields are rejected.
 
+#### Uploading a file
+
+To attach a file, send `multipart/form-data` instead of JSON. Use the same text fields plus one `file` part:
+
+```sh
+curl -X POST http://localhost:8787/notify \
+  -H "Authorization: Bearer $DISPATCH_API_KEY" \
+  -F message="Monthly report" \
+  -F priority=low \
+  -F file=@./report.pdf
+```
+
+- `file` is optional, and only one file is allowed per request. It can be at most 50 MB.
+- With a file, `message` is optional and becomes the caption, limited to 1024 characters.
+- Unknown parts are rejected. Uploads get at least 2 minutes to reach Telegram.
+- Uploads are held in memory, so at most 4 run at once. Beyond that, the server returns `429 RATE_LIMITED` with `Retry-After`.
+
 **Success** returns `200`:
 
 ```json
@@ -290,8 +318,10 @@ Error codes are stable and safe to match in code.
 | 404 | `NOT_FOUND` | Unknown path |
 | 405 | `METHOD_NOT_ALLOWED` | Wrong HTTP method (see the `Allow` header) |
 | 413 | `PAYLOAD_TOO_LARGE` | Request body over 64 KiB |
-| 413 | `MESSAGE_TOO_LARGE` | Rendered message over Telegram's 4096-character limit |
-| 415 | `UNSUPPORTED_MEDIA_TYPE` | `Content-Type` is not `application/json` |
+| 413 | `PAYLOAD_TOO_LARGE` (upload) | Multipart body over 51 MiB, or a text field over 64 KiB |
+| 413 | `MESSAGE_TOO_LARGE` | Rendered message over 4096 characters, or caption over 1024 |
+| 413 | `ATTACHMENT_TOO_LARGE` | File over Telegram's 50 MB bot upload limit |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | `Content-Type` is not `application/json` or `multipart/form-data` |
 | 429 | `RATE_LIMITED` | Dispatch's or Telegram's rate limit; honor `Retry-After` |
 | 502 | `INVALID_CREDENTIALS` | Telegram rejected the bot token |
 | 502 | `INVALID_DESTINATION` | Chat not found, bot blocked or removed, group migrated |
@@ -361,6 +391,19 @@ class Command(BaseCommand):
             raise
 ```
 
+Uploading a file from Python:
+
+```python
+with open("report.pdf", "rb") as f:
+    requests.post(
+        "http://127.0.0.1:8787/notify",
+        headers={"Authorization": f"Bearer {os.environ['DISPATCH_API_KEY']}"},
+        data={"message": "Monthly report"},
+        files={"file": ("report.pdf", f)},
+        timeout=150,
+    )
+```
+
 **Node.js**
 
 ```js
@@ -394,6 +437,7 @@ resp, err := http.DefaultClient.Do(req)
 - **Transient failures are retried automatically:** network errors, timeouts, HTTP 5xx, and HTTP 429. Dispatch makes up to 3 attempts, with exponential backoff and jitter (0.5s, then 1s, capped at 8s), all within the overall `--timeout`.
 - **Telegram's `retry_after` is honored** when it is 30s or less and fits within the remaining timeout. Otherwise Dispatch fails right away with `RATE_LIMITED` (exit code `4`, HTTP `429` with `Retry-After`).
 - **Permanent failures are not retried.** These include an invalid token, chat not found, a blocked bot, or a malformed message.
+- **Uploads are retried too.** The whole file is sent again on each attempt. Each JSON call has a 15-second limit per attempt. Uploads are limited only by the overall timeout.
 - **Duplicates are possible.** If a request times out after Telegram received it, Dispatch cannot tell whether Telegram accepted it. Retrying in that case can deliver the message twice. Dispatch prefers at-least-once delivery for transient errors. It cannot provide exactly-once delivery.
 - Nothing is queued. If every attempt fails, the error goes back to the caller, which decides what to do next.
 
@@ -504,7 +548,9 @@ Point your load balancer or orchestrator health checks at `/healthz` (liveness) 
 | `Telegram rate limit exceeded` (exit 4 / HTTP 429) | Telegram limits bots to about 1 msg/s per chat and 20 msgs/min per group. Wait for `Retry-After`, or batch messages. |
 | `timed out contacting Telegram` | Check outbound HTTPS access to `api.telegram.org`. The message may still have arrived. |
 | `could not resolve the Telegram API host` | Check DNS. In restricted networks, set `HTTPS_PROXY`, which Dispatch respects. |
-| `message is N characters … limit is 4096` | Shorten the message, or split it and send each part. |
+| `message is N characters … limit is 4096` | Shorten the message, split it into parts, or send it as a file with `--attach`. |
+| `caption is N characters … limit with an attachment is 1024` | Shorten the caption, or send the long text as a separate message. |
+| `DISPATCH_CHAT_ID belongs to a bot` | You used the bot's own ID, which `getMe` returns. Use your user ID instead (ask @userinfobot) or a group ID. |
 | `refusing to listen on non-loopback address` | Add `--allow-remote` after reading [Network exposure](#security). |
 | Config file warning about permissions | Run `chmod 600 "$(dispatch config path)"`. |
 
