@@ -18,6 +18,7 @@ import (
 	"github.com/iraosandeep/dispatch/internal/config"
 	"github.com/iraosandeep/dispatch/internal/notification"
 	"github.com/iraosandeep/dispatch/internal/telegram"
+	"github.com/iraosandeep/dispatch/internal/update"
 )
 
 // Exit codes. These are part of the public interface for shell scripts.
@@ -45,6 +46,9 @@ type App struct {
 	Build  BuildInfo
 	// IsTerminal reports whether stdin is an interactive terminal.
 	IsTerminal func() bool
+	// Updater and Executable support `dispatch update`; injectable for tests.
+	Updater    *update.Updater
+	Executable func() (string, error)
 
 	configPath string
 	verbose    bool
@@ -63,6 +67,8 @@ func Main(build BuildInfo) int {
 		Getenv:     os.Getenv,
 		Build:      build,
 		IsTerminal: func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
+		Updater:    &update.Updater{},
+		Executable: os.Executable,
 	}
 	return app.Run(ctx, os.Args[1:])
 }
@@ -94,7 +100,8 @@ Get started:
   dispatch config init        interactive setup
   dispatch test               send a test message
   dispatch send "Hello"       send a notification
-  dispatch serve              start the HTTP API on 127.0.0.1:8787`,
+  dispatch serve              start the HTTP API on 127.0.0.1:8787
+  dispatch update             upgrade to the latest release`,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
@@ -104,7 +111,7 @@ Get started:
 		return usageError(err)
 	})
 
-	root.AddCommand(a.sendCmd(), a.testCmd(), a.serveCmd(), a.configCmd(), a.versionCmd())
+	root.AddCommand(a.sendCmd(), a.testCmd(), a.serveCmd(), a.configCmd(), a.versionCmd(), a.updateCmd())
 	return root
 }
 

@@ -10,17 +10,23 @@ import (
 
 	"github.com/iraosandeep/dispatch/internal/config"
 	"github.com/iraosandeep/dispatch/internal/telegram/telegramtest"
+	"github.com/iraosandeep/dispatch/internal/update"
+	"github.com/iraosandeep/dispatch/internal/update/updatetest"
 )
 
 const botToken = "123456:CLI-test-secret-token"
 
 type harness struct {
-	tg     *telegramtest.Server
-	env    map[string]string
-	stdin  string
-	tty    bool
-	stdout bytes.Buffer
-	stderr bytes.Buffer
+	tg    *telegramtest.Server
+	env   map[string]string
+	stdin string
+	tty   bool
+	// update command dependencies
+	version string
+	updater *update.Updater
+	exe     string
+	stdout  bytes.Buffer
+	stderr  bytes.Buffer
 }
 
 func newHarness(t *testing.T) *harness {
@@ -47,6 +53,11 @@ func (h *harness) run(args ...string) int {
 		Getenv:     func(k string) string { return h.env[k] },
 		Build:      BuildInfo{Version: "test", Commit: "abc", Date: "today"},
 		IsTerminal: func() bool { return h.tty },
+		Updater:    h.updater,
+		Executable: func() (string, error) { return h.exe, nil },
+	}
+	if h.version != "" {
+		app.Build.Version = h.version
 	}
 	return app.Run(context.Background(), args)
 }
@@ -412,4 +423,85 @@ func TestSendAttachmentErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func newUpdateHarness(t *testing.T, version string, rel updatetest.Release) (*harness, string) {
+	t.Helper()
+	h := newHarness(t)
+	srv := updatetest.NewServer(t, rel)
+	exe := filepath.Join(t.TempDir(), "dispatch")
+	os.WriteFile(exe, []byte("old-binary"), 0o755)
+	h.version = version
+	h.updater = &update.Updater{Repo: updatetest.Repo, BaseURL: srv.URL, GOOS: rel.GOOS, GOARCH: rel.GOARCH}
+	h.exe = exe
+	return h, exe
+}
+
+func TestUpdate(t *testing.T) {
+	rel := updatetest.Release{Tag: "v0.2.0", GOOS: "linux", GOARCH: "amd64", Binary: []byte("new-binary")}
+	h, exe := newUpdateHarness(t, "0.1.0", rel)
+	if code := h.run("update"); code != ExitOK {
+		t.Fatalf("exit %d: %s", code, h.stderr.String())
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "new-binary" {
+		t.Errorf("binary = %q", got)
+	}
+	if !strings.Contains(h.stdout.String(), "Updated") || !strings.Contains(h.stdout.String(), "checksum verified") {
+		t.Errorf("stdout = %s", h.stdout.String())
+	}
+}
+
+func TestUpdateAlreadyCurrent(t *testing.T) {
+	rel := updatetest.Release{Tag: "v0.2.0", GOOS: "linux", GOARCH: "amd64", Binary: []byte("new")}
+	h, exe := newUpdateHarness(t, "0.2.0", rel)
+	if code := h.run("update"); code != ExitOK || !strings.Contains(h.stdout.String(), "up to date") {
+		t.Fatalf("exit %d: %s %s", code, h.stdout.String(), h.stderr.String())
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "old-binary" {
+		t.Error("binary should be untouched")
+	}
+}
+
+func TestUpdateCheckOnly(t *testing.T) {
+	rel := updatetest.Release{Tag: "v0.2.0", GOOS: "linux", GOARCH: "amd64", Binary: []byte("new")}
+	h, exe := newUpdateHarness(t, "0.1.0", rel)
+	if code := h.run("update", "--check"); code != ExitOK || !strings.Contains(h.stdout.String(), "update is available") {
+		t.Fatalf("exit %d: %s", code, h.stdout.String())
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "old-binary" {
+		t.Error("--check must not modify the binary")
+	}
+}
+
+func TestUpdateDevBuildNeedsForce(t *testing.T) {
+	rel := updatetest.Release{Tag: "v0.2.0", GOOS: "linux", GOARCH: "amd64", Binary: []byte("new")}
+	h, exe := newUpdateHarness(t, "ec85fc4-dirty", rel)
+	if code := h.run("update"); code != ExitUsage || !strings.Contains(h.stderr.String(), "--force") {
+		t.Fatalf("exit %d: %s", code, h.stderr.String())
+	}
+	if code := h.run("update", "--force"); code != ExitOK {
+		t.Fatalf("--force exit %d: %s", code, h.stderr.String())
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "new" {
+		t.Errorf("binary = %q", got)
+	}
+}
+
+func TestUpdateFailures(t *testing.T) {
+	t.Run("no release", func(t *testing.T) {
+		h, _ := newUpdateHarness(t, "0.1.0", updatetest.Release{GOOS: "linux", GOARCH: "amd64"})
+		if code := h.run("update"); code != ExitFailure || !strings.Contains(h.stderr.String(), "no release") {
+			t.Fatalf("exit %d: %s", code, h.stderr.String())
+		}
+	})
+	t.Run("bad checksum", func(t *testing.T) {
+		rel := updatetest.Release{Tag: "v0.2.0", GOOS: "linux", GOARCH: "amd64", Binary: []byte("evil"), CorruptChecksum: true}
+		h, exe := newUpdateHarness(t, "0.1.0", rel)
+		if code := h.run("update"); code != ExitFailure || !strings.Contains(h.stderr.String(), "checksum mismatch") {
+			t.Fatalf("exit %d: %s", code, h.stderr.String())
+		}
+		if got, _ := os.ReadFile(exe); string(got) != "old-binary" {
+			t.Error("binary must be untouched after a failed verification")
+		}
+	})
 }

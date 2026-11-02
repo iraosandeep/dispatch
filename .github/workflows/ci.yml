@@ -28,6 +28,14 @@ jobs:
       - run: go test -race ./...
       - run: go build ./cmd/dispatch
 
+  install-script:
+    name: Install script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck install.sh
+      - run: sh -n install.sh
+
   cross-build:
     name: Cross-compile
     runs-on: ubuntu-latest

@@ -33,13 +33,47 @@ dispatch send "Backup successful"
 
 ## Install
 
-### Prebuilt binaries
-
-Download the archive for your platform from [GitHub Releases](https://github.com/iraosandeep/dispatch/releases). Builds are available for macOS (Apple Silicon and Intel), Linux (amd64 and arm64), and Windows (amd64). You don't need Go installed.
+### macOS and Linux (recommended)
 
 ```sh
-# Example: Linux amd64
-VERSION=1.0.0
+curl -fsSL https://raw.githubusercontent.com/iraosandeep/dispatch/main/install.sh | sh
+```
+
+The installer:
+- detects your OS and CPU, including Apple Silicon and Intel Macs and Linux on amd64 or arm64
+- downloads the latest release and **verifies its SHA-256 checksum** before installing
+- installs to `~/.local/bin`, so it doesn't need `sudo`
+- adds that folder to your `PATH` in your shell profile (zsh, bash, fish, or `~/.profile`)
+
+You don't need Go installed.
+
+| Option | Example |
+|---|---|
+| Install a specific version | `curl -fsSL …/install.sh \| DISPATCH_VERSION=v0.2.0 sh` |
+| Install somewhere else | `curl -fsSL …/install.sh \| DISPATCH_INSTALL_DIR=/usr/local/bin sudo -E sh` |
+| Don't edit my shell profile | `curl -fsSL …/install.sh \| DISPATCH_NO_MODIFY_PATH=1 sh` |
+| Uninstall | `curl -fsSL …/install.sh \| sh -s -- --uninstall` |
+
+To read the script before running it: `curl -fsSL https://raw.githubusercontent.com/iraosandeep/dispatch/main/install.sh | less`.
+
+### Updating
+
+```sh
+dispatch update            # download, verify, and replace the binary in place
+dispatch update --check    # only check whether a newer version exists
+dispatch update --version v0.2.0   # install a specific version (also allows downgrades)
+```
+
+`dispatch update` verifies the release checksum before replacing anything, and it leaves your configuration alone. Re-running the install script also upgrades. Homebrew installs should use `brew upgrade` instead. Builds from source report a development version, so they need `dispatch update --force`.
+
+### Windows
+
+Download `dispatch_<version>_windows_amd64.zip` from [GitHub Releases](https://github.com/iraosandeep/dispatch/releases), extract `dispatch.exe`, and put it in a folder on your `PATH`. After that, `dispatch update` works on Windows too.
+
+### Manual download
+
+```sh
+VERSION=0.1.0   # without the leading v
 curl -LO https://github.com/iraosandeep/dispatch/releases/download/v${VERSION}/dispatch_${VERSION}_linux_amd64.tar.gz
 curl -LO https://github.com/iraosandeep/dispatch/releases/download/v${VERSION}/checksums.txt
 shasum -a 256 -c checksums.txt --ignore-missing
@@ -47,13 +81,13 @@ tar -xzf dispatch_${VERSION}_linux_amd64.tar.gz
 sudo install dispatch /usr/local/bin/
 ```
 
-On macOS, if Gatekeeper blocks the unsigned binary, run `xattr -d com.apple.quarantine ./dispatch`.
-
 ### With Go
 
 ```sh
 go install github.com/iraosandeep/dispatch/cmd/dispatch@latest
 ```
+
+This installs to `$(go env GOPATH)/bin`, usually `~/go/bin`. Make sure that folder is on your `PATH`.
 
 ### Homebrew
 
