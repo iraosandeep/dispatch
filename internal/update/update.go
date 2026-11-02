@@ -223,6 +223,14 @@ func Install(path string, bin []byte) error {
 		if err := os.Rename(path, old); err != nil {
 			return err
 		}
+		if err := os.Rename(tmp.Name(), path); err != nil {
+			_ = os.Rename(old, path) // restore the previous binary
+			return err
+		}
+		// Fails while the old binary is still running; the next update
+		// removes it.
+		_ = os.Remove(old)
+		return nil
 	}
 	return os.Rename(tmp.Name(), path)
 }
